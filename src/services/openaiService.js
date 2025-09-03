@@ -130,66 +130,89 @@ class OpenAIService {
     return this.recentMemory.slice(-contextWindow);
   }
 
-  // Build companion prompt based on configuration
+  // Build companion prompt based on configuration 
+  // Build companion prompt based on configuration 
   buildCompanionPrompt(companion, context) {
     const config = COMPANION_CONFIG[companion];
     if (!config) return '';
 
-    let prompt = `You are ${config.name}, ${config.title}. ${config.personality.core}\n\n`;
-    
-    // Add personality traits
-    prompt += `Your traits: ${config.personality.traits.join(', ')}.\n`;
-    prompt += `Communication style: ${config.personality.communication}\n`;
-    prompt += `Approach: ${config.personality.approach}\n\n`;
-    
-    // Add expertise
-    prompt += `Primary expertise: ${config.expertise.primary.join(', ')}.\n`;
-    prompt += `You have deep knowledge of: ${config.expertise.knowledge.join(', ')}.\n\n`;
-    
-    // Add current location context
+    // Guardrails (unchanged)
+    let prompt = `SAFETY-CRISIS-POLICY:
+    - If self-harm risk appears, pause normal style.
+    - Be supportive, nonjudgmental, concise. No clinical advice or guarantees.
+    - Ask once if there’s immediate danger or a plan today.
+    - Urge contacting trained humans; if imminent, advise local emergency services.
+    - Brief resources if relevant: "988 (US, 24/7), text HOME to 741741, or local emergency number."
+    - No metaphors/mysticism during risk. Resume normal style only when safe.\n\n`;
+
+    // Base natural style
+    prompt += `You are ${config.name}, ${config.title}. ${config.personality.core}
+    Speak like a caring friend—warm, modern, grounded. Short, natural sentences.
+    Reply format:
+    1) Mirror the user’s main feeling/need in one short line.
+    2) Offer one gentle insight or reframe.\n\n`;
+
+    // === Companion-specific style tweaks ===
+    const styleProfiles = {
+      elara: "Tone: soft, nurturing, with light nature metaphors. Prefer gentle reflections and calming practices. Avoid direct instructions.",
+      bramble: "Tone: practical and action-oriented. Use plain words, minimal metaphors. Favor concrete steps or short lists over abstract ideas.",
+      kael: "Tone: philosophical and curious. Longer sentences acceptable. Use thoughtful questions and abstract reframes; avoid giving tasks."
+    };
+    if (styleProfiles[companion]) {
+      prompt += `VOICE STYLE: ${styleProfiles[companion]}\n\n`;
+    }
+
+    // Traits
+    prompt += `Your traits: ${config.personality.traits.join(', ')}.
+    Communication style: ${config.personality.communication}
+    Approach: ${config.personality.approach}\n\n`;
+
+    // Expertise
+    prompt += `Primary expertise: ${config.expertise.primary.join(', ')}.
+    Deep knowledge: ${config.expertise.knowledge.join(', ')}.\n\n`;
+
+    // Location
     if (context.currentLandmark) {
       const landmark = WORLD_CONFIG.landmarks[context.currentLandmark];
       if (landmark) {
-        prompt += `Current location: ${landmark.name}. ${landmark.description}\n`;
-        prompt += `Available here: ${landmark.activities.join(', ')}.\n\n`;
+        prompt += `Current location: ${landmark.name}. ${landmark.description}
+    Available here: ${landmark.activities.join(', ')}.\n\n`;
       }
     }
-    
-    // Add recent conversation context
+
+    // Conversation history
     const recentContext = this.getRecentContext();
     if (recentContext.length > 0) {
       prompt += `Recent conversation:\n`;
       recentContext.forEach(msg => {
         prompt += `${msg.sender}: ${msg.content}\n`;
       });
-      prompt += '\n';
+      prompt += `Reflect the user’s words before replying. If the last message wasn’t from player, vary your wording.\n\n`;
     }
-    
-    // Add response constraints
-    prompt += `IMPORTANT INSTRUCTIONS:\n`;
-    prompt += `- Respond in ${RESPONSE_CONFIG.ideal_words}-${RESPONSE_CONFIG.max_words} words maximum\n`;
-    prompt += `- Blend your expertise with the mystical environment naturally\n`;
-    prompt += `- Reference specific features of the current location when relevant\n`;
-    prompt += `- Draw from both mystical and real-world knowledge\n`;
-    prompt += `- Be concise but meaningful\n`;
-    
-    // Add context-specific instructions
+
+    // Response constraints (unchanged)
+    prompt += `IMPORTANT INSTRUCTIONS:
+    - Stay within ${RESPONSE_CONFIG.ideal_words}-${RESPONSE_CONFIG.max_words} words
+    - Blend expertise with the mystical setting naturally (light, human)
+    - Reference the location when relevant (one detail is enough)
+    - Draw from mystical + real-world knowledge without certainty or guarantees
+    - Be concise but meaningful: reflect → one insight → one tiny practice OR one question\n`;
+
+    // Context-specific
     if (context.responseType === 'discussion') {
       const otherCompanion = context.discussionWith;
       const dynamic = getRelationshipDynamic(companion, otherCompanion);
       if (dynamic) {
-        prompt += `- You're discussing with ${otherCompanion}. ${dynamic.interaction_style}\n`;
+        prompt += `- You’re discussing with ${otherCompanion}. ${dynamic.interaction_style} Keep it collaborative and conversational.\n`;
       }
     }
-    
     if (context.responseType === 'reaction') {
-      prompt += `- You're responding to ${context.reactingTo}'s point. Be supportive or offer a complementary perspective.\n`;
+      prompt += `- You’re responding to ${context.reactingTo}’s point. Mention their name, acknowledge their view, then add a supportive or complementary take.\n`;
     }
-    
     if (context.shouldSynthesize) {
-      prompt += `- Synthesize the different perspectives shared into a unified understanding.\n`;
+      prompt += `- Synthesize perspectives into a simple, user-centered understanding.\n`;
     }
-    
+
     return prompt;
   }
 
@@ -203,7 +226,7 @@ class OpenAIService {
       try {
         const messages = [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: message }
+          { role: 'user', content: message+", end response with ." }
         ];
         
         const estimatedTokens = TokenCounter.countMessageTokens(messages);
@@ -212,8 +235,8 @@ class OpenAIService {
         const response = await this.makeBackendRequest('/api/chat/completions', {
           model: 'gpt-4o-mini',
           messages: messages,
-          max_completion_tokens: 80, // Allow slightly more for better responses
-          temperature: 0.8, // Add some creativity
+          max_completion_tokens: 100, // slightly more headroom for natural pacing
+          temperature: 0.9, // a touch warmer/spontaneous
         });
 
         let responseText = response.choices[0]?.message?.content || '';
@@ -256,12 +279,10 @@ class OpenAIService {
   async generateCompanionDiscussion(companion1, companion2, topic, context = {}) {
     const dynamic = getRelationshipDynamic(companion1, companion2);
     
-    let discussionPrompt = `You are having a discussion with ${companion2} about: ${topic}.\n`;
-    if (dynamic) {
-      discussionPrompt += `Your interaction style: ${dynamic.interaction_style}\n`;
-      discussionPrompt += `Common ground: ${dynamic.common_ground.join(', ')}\n`;
-    }
-    discussionPrompt += `Offer your perspective based on your expertise, in ${RESPONSE_CONFIG.response_types.supportive.max_words} words.`;
+    let discussionPrompt = `You are having a discussion with ${companion2} about: ${topic}.
+${dynamic ? `Your interaction style: ${dynamic.interaction_style}
+Common ground: ${dynamic.common_ground.join(', ')}
+` : ''}Offer your perspective based on your expertise, in ${RESPONSE_CONFIG.response_types.supportive.max_words} words.`;
     
     return this.generateCompanionResponse(
       companion1, 
@@ -280,9 +301,9 @@ class OpenAIService {
     const landmark = context.currentLandmark ? WORLD_CONFIG.landmarks[context.currentLandmark] : null;
     
     const fallbacks = {
-      elara: `The spiritual energies here ${landmark ? `in ${landmark.name}` : ''} invite deep exploration.`,
-      bramble: `This touches on something important. ${landmark ? `Perhaps ${landmark.features[0]} can help us explore this.` : 'Let\'s explore this together.'}`,
-      kael: `An intriguing question that invites philosophical reflection ${landmark ? `here in ${landmark.name}` : ''}.`
+      elara: `I hear this matters to you. ${landmark ? `Here in ${landmark.name}, maybe we try one small step together.` : `Let’s try one small step together.`}`,
+      bramble: `Thanks for sharing that. ${landmark ? `Perhaps ${landmark.features[0]} could be a simple place to start.` : `Let’s start with one simple step.`}`,
+      kael: `That’s a thoughtful thread to pull ${landmark ? `amid ${landmark.name}` : ''}. Let’s explore one angle clearly.`
     };
     
     return fallbacks[companion] || "Let's explore this together.";

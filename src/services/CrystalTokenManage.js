@@ -6,7 +6,7 @@ import openAIService from './openaiService';
 
 class CrystalTokenManager {
   constructor() {
-    this.TOKENS_PER_CRYSTAL = 6000; // 6k tokens per crystal
+    this.TOKENS_PER_CRYSTAL = 15000; // 6k tokens per crystal
     this.tokenCheckpoints = [];
     this.userId = null;
     this.tokensUsed = 0;
@@ -67,7 +67,7 @@ class CrystalTokenManager {
       return await this.checkCrystalRequirement();
     }
 
-    return { requiresCrystal: false };
+    return { newTokens:newTokens, TokenUsed:this.tokensUsed, requiresCrystal: false };
   }
 
   // Check if crystal is required

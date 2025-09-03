@@ -16,7 +16,6 @@ import { useUser } from '../context/UserContext';
 import MessageBubble from '../components/MessageBubble';
 import CompanionHeader from '../components/CompanionHeader';
 import CrystalRequestModal from '../components/CrystalRequestModal';
-import { CHARACTERS,CHARACTER_INFO } from '../constants/story';
 import { createMessage, MESSAGE_TYPES } from '../utils/messageTypes';
 import storyEngine from '../services/storyEngine';
 import crystalTokenManager from '../services/CrystalTokenManage';
@@ -25,8 +24,10 @@ import journeyService from '../services/journeyService';
 import imageCacheService from '../services/imageCacheService';
 import openAIService from '../services/openaiService';
 import { 
+  CHARACTERS,
   WORLD_CONFIG, 
   RESPONSE_CONFIG,
+  COMPANION_CONFIG  // ADD THIS IMPORT - was likely missing
 } from '../constants/story';
 
 export default function ChatScreen({ navigation, route }) {
@@ -142,9 +143,13 @@ export default function ChatScreen({ navigation, route }) {
         // Set journey ID
         setJourneyId(journeyState.journeyId);
         
-        // Restore story engine state
-        storyEngine.currentStage = journeyState.storyStage;
-        storyEngine.storyState = journeyState.storyState;
+        // Restore story engine state - FIX: Add null checks
+        if (journeyState.storyStage !== undefined) {
+          storyEngine.currentStage = journeyState.storyStage;
+        }
+        if (journeyState.storyState) {
+          storyEngine.storyState = journeyState.storyState;
+        }
         
         // Initialize story context for current stage
         const restoredContext = await storyEngine.initializeWorldContext();
@@ -173,9 +178,9 @@ export default function ChatScreen({ navigation, route }) {
             return msg;
           })
         );
-        
+        console.log('CACHEDMESSAGES:',cachedMessages)
         setMessages(cachedMessages);
-        setCurrentStage(journeyState.storyStage);
+        setCurrentStage('STAGE');
         
         // Update token progress
         updateTokenProgress();
@@ -218,7 +223,7 @@ export default function ChatScreen({ navigation, route }) {
       // Use environment description from story context
       const environment = context?.environment || {
         location: "The Crystal Realm",
-        description: "A mystical realm filled with glowing crystals and magical energy.",
+        description: "A mystical realm filled with glowing crystals and magical energy. Three crystal creatures emerge from the glow and approach you",
         atmosphere: "mystical and welcoming",
         keyFeatures: [
           "Glowing crystal formations",
@@ -229,7 +234,7 @@ export default function ChatScreen({ navigation, route }) {
 
       // Enhanced opening narration
       const openingNarration = [
-        `You find yourself standing within ${environment.location}. ${environment.description}`,
+        `You find yourself standing within ${environment.location}, ${environment.description}`,
       ];
 
       // Add narrator messages with delays
@@ -333,19 +338,260 @@ export default function ChatScreen({ navigation, route }) {
     setIsProcessingResponses(true);
 
     // Log player message
-    messageLogger.logMessage({ ...playerMessage, journeyId });
+    messageLogger.logMessage({
+      type: MESSAGE_TYPES.TEXT,
+      sender: CHARACTERS.PLAYER,
+      content: inputText.trim(),
+      landmark: storyEngine.currentLandmark,
+      timestamp: new Date().toISOString(),
+      journeyId: journeyId
+    });
+    console.log('here')
 
+     // Process with multi-companion system
     try {
-      // Process with multi-companion system
-      const allResponses = await processPlayerMessage(inputText.trim());
+       
+        // update message count
+      storyEngine.messageCount++;
+      // Update memory
+      openAIService.updateMemory(playerMessage, 'player');
+      console.log('here 1')
+      // FIX: Initialize conversationMemory if it doesn't exist
+      if (!storyEngine.conversationMemory) {
+        storyEngine.conversationMemory = {
+          recentMessages: [],
+          currentThemes: [],
+          emotionalTone: 'neutral',
+          playerInterests: []
+        };
+      }
+      
+      storyEngine.conversationMemory.recentMessages.push({
+        sender: 'player',
+        content: playerMessage,
+        timestamp: Date.now()
+      });
 
+      // Keep memory size limited
+      if (storyEngine.conversationMemory.recentMessages.length > RESPONSE_CONFIG.memory.recent_messages) {
+        storyEngine.conversationMemory.recentMessages.shift();
+      }
+
+      openAIService.conversationHistory.push(playerMessage);
+      console.log('here 2')
+
+      // Analyze message
+      const playerAnalysis = await storyEngine.analyzePlayerMessage(playerMessage.content);
+      console.log('🔍 Player Analysis:', playerAnalysis);
+      console.log('here 3')
+      // Update conversation memory
+      storyEngine.conversationMemory.currentThemes = playerAnalysis.topics;
+      storyEngine.conversationMemory.emotionalTone = playerAnalysis.emotionalTone;
+      storyEngine.conversationMemory.playerInterests = [...new Set([
+        ...storyEngine.conversationMemory.playerInterests,
+        ...playerAnalysis.expertiseNeeded
+      ])];
+
+      // Check for landmark changes
+      if (playerAnalysis.mentionedLandmarks.length > 0) {
+        const newLandmark = playerAnalysis.mentionedLandmarks[0];
+        if (newLandmark !== storyEngine.currentLandmark) {
+          console.log(`📍 Moving to ${WORLD_CONFIG.landmarks[newLandmark].name}`);
+          storyEngine.currentLandmark = newLandmark;
+        }
+      }
+
+      // Determine responding companions
+      const respondingCompanions = await storyEngine.determineRespondingCompanions(playerAnalysis);
+      console.log('👥 Responding companions:', respondingCompanions);
+
+      const responses = [];
+
+      // Generate primary responses
+      for (const companion of respondingCompanions) {
+        try {
+          const context = {
+            currentLandmark: storyEngine.currentLandmark,
+            emotionalTone: playerAnalysis.emotionalTone,
+            topics: playerAnalysis.topics,
+            responseType: 'primary'
+          };
+
+          const response = await openAIService.generateCompanionResponse(
+            companion,
+            playerMessage.content,
+            context
+          );
+
+          console.log('👥 response:', response)
+          // Update companion state - FIX: Check if companionStates exists
+          if (!storyEngine.companionStates) {
+            storyEngine.companionStates = {
+              elara: { lastSpoke: 0, recentTopics: [] },
+              bramble: { lastSpoke: 0, recentTopics: [] },
+              kael: { lastSpoke: 0, recentTopics: [] }
+            };
+          }
+          
+          storyEngine.companionStates[companion].lastSpoke = storyEngine.messageCount;
+          storyEngine.companionStates[companion].recentTopics = playerAnalysis.topics;
+
+          // Show typing indicator for current companion
+          setCurrentlyTypingCompanion(response.sender);
+          console.log('👥 CHECK:')
+          // Create and add companion message
+          const companionMessage = createMessage(
+            MESSAGE_TYPES.TEXT,
+            response.sender,
+            response.text,
+            'stage'
+          );
+          console.log('👥 COMPANION MESS:',companionMessage)
+          setMessages(prev => [...prev, companionMessage]);
+          console.log('👥 CHECK2')
+          // Log companion message
+          messageLogger.logMessage({
+            type: MESSAGE_TYPES.TEXT,
+            sender: companion,
+            content: response.text,
+            landmark: storyEngine.currentLandmark,
+            timestamp: new Date().toISOString(),
+            journeyId: journeyId
+          });
+
+          responses.push({
+            type: 'companion',
+            sender: companion,
+            text: response.text,
+            tokensUsed: response.tokensUsed,
+            totalTokens: response.totalTokens
+          });
+
+          // Update memory
+          openAIService.updateMemory(companionMessage, companion); 
+          openAIService.conversationHistory.push(companionMessage);     
+          storyEngine.conversationMemory.recentMessages.push({
+            sender: companion,
+            content: companionMessage,
+            timestamp: Date.now()
+          });
+
+        } catch (error) {
+          console.error(`Error generating response for ${companion}:`, error);
+        }
+      }
+
+      // Check if companions should discuss
+      if (storyEngine.shouldCompanionsDiscuss(playerAnalysis, respondingCompanions) && respondingCompanions.length >= 2) {
+        console.log('💬 Companions are discussing...');
+        
+        const [companion1, companion2] = respondingCompanions;
+        const discussionTopic = playerAnalysis.topics[0] || playerMessage.content;
+        
+        try {
+          // Companion 1 responds to Companion 2's perspective, 60% chance
+          if (Math.random() < 0.6) {
+            const discussion1 = await openAIService.generateCompanionDiscussion(
+              companion1,
+              companion2,
+              discussionTopic,
+              { currentLandmark: storyEngine.currentLandmark }  // FIX: Use storyEngine.currentLandmark
+            );
+
+            // Show typing indicator for current companion
+            setCurrentlyTypingCompanion(companion1);
+            
+            // Create and add companion message
+            const companionMessage = createMessage(
+              MESSAGE_TYPES.TEXT,
+              companion1,
+              discussion1.text,
+              'stage'
+            );
+            
+            setMessages(prev => [...prev, companionMessage]);
+
+            responses.push({
+              type: 'discussion',
+              sender: companion1,
+              text: discussion1.text,
+              discussingWith: companion2,
+              tokensUsed: discussion1.tokensUsed
+            });
+
+            messageLogger.logMessage({
+              type: MESSAGE_TYPES.TEXT,
+              sender: companion1,
+              content: discussion1.text,
+              landmark: storyEngine.currentLandmark,
+              timestamp: new Date().toISOString(),
+              journeyId: journeyId
+            });
+
+            // Update memory
+            openAIService.updateMemory(companionMessage, companion1);  
+            openAIService.conversationHistory.push(companionMessage);        
+            storyEngine.conversationMemory.recentMessages.push({
+              sender: companion1,
+              content: companionMessage,
+              timestamp: Date.now()
+            });
+          }
+          // Companion 2 might respond back
+          if (Math.random() < 0.1) {
+            const discussion2 = await openAIService.generateCompanionDiscussion(
+              companion2,
+              companion1,
+              discussionTopic,
+              { currentLandmark: storyEngine.currentLandmark }  // FIX: Use storyEngine.currentLandmark
+            );
+            
+            // Show typing indicator for current companion
+          setCurrentlyTypingCompanion(companion2);
+          
+          // Create and add companion message
+          const companionMessage2 = createMessage(
+            MESSAGE_TYPES.TEXT,
+            companion2,
+            discussion2.text,
+            'stage'
+          );
+          
+          setMessages(prev => [...prev, companionMessage2]);
+
+            responses.push({
+              type: 'discussion',
+              sender: companion2,
+              text: discussion2.text,
+              discussingWith: companion1,
+              tokensUsed: discussion2.tokensUsed
+            });
+
+            // Update memory
+            openAIService.updateMemory(companionMessage2, companion2);  
+            openAIService.conversationHistory.push(companionMessage);        
+            storyEngine.conversationMemory.recentMessages.push({
+              sender: companion2,
+              content: companionMessage2,
+              timestamp: Date.now()
+            });
+          }
+
+        } catch (error) {
+          console.error('Error generating discussion:', error);
+        }
+      }
       // Update current stage
       setCurrentStage(storyEngine.currentStage);
 
-      // Force save after important interactions
-      if (storyEngine.currentStage !== currentStage || 
-          allResponses.some(r => r.beatContext)) {
-        await saveJourneyState();
+      // 🔥 UPDATED: Handle crystal requirements as message bubbles
+      let totalTokensCurrentChat=0;
+      console.log(responses)
+      responses.forEach((element,i)=>{totalTokensCurrentChat=totalTokensCurrentChat+element.tokensUsed});
+      const tokenResult = await crystalTokenManager.updateTokenCount(totalTokensCurrentChat);
+      console.log(tokenResult)
+      if (tokenResult.requiresCrystal) {
+        await handleCrystalRequirementAsBubble(tokenResult, '');
       }
 
     } catch (error) {
@@ -358,219 +604,70 @@ export default function ChatScreen({ navigation, route }) {
     setIsProcessingResponses(false);
   };
 
-  // Process player message
-  const processPlayerMessage= async (playerMessage) =>{
-    // update message count
-    storyEngine.messageCount++;
-    // Update memory
-    openAIService.updateMemory(playerMessage, 'player');
-    storyEngine.conversationMemory.recentMessages.push({
-      sender: 'player',
-      content: playerMessage,
-      timestamp: Date.now()
-    });
-
-    // Keep memory size limited
-    if (storyEngine.conversationMemory.recentMessages.length > RESPONSE_CONFIG.memory.recent_messages) {
-      storyEngine.conversationMemory.recentMessages.shift();
-    }
-
-    // Log player message
+  // 🔥 NEW: Handle crystal requirement as message bubble
+  const handleCrystalRequirementAsBubble = async (tokenResult, requestingCompanion) => {
+    console.log('💎 Creating crystal request bubble...');
+    
+    // Generate contextual crystal request message
+    const crystalRequestMessage = await generateContextualCrystalMessage(tokenResult, requestingCompanion);
+    
+    // Create crystal request message bubble
+    const crystalMessage = createMessage(
+      MESSAGE_TYPES.CRYSTAL_REQUEST,
+      CHARACTERS.SYSTEM,
+      crystalRequestMessage,
+      storyEngine.currentStage
+    );
+    
+    // Add crystal-specific data
+    crystalMessage.crystalData = {
+      cost: tokenResult.crystalCost || 1,
+      remainingCrystals: crystals,
+      requestingCompanion: requestingCompanion,
+      environment: storyContext?.environment?.location || 'the Crystal Realm',
+      currentBeat: currentBeat?.title || 'your magical journey',
+      canAfford: crystals >= (tokenResult.crystalCost || 1),
+      isAutoDeducted: tokenResult.crystalDeducted || false
+    };
+    
+    // Add unique ID for crystal request tracking
+    crystalMessage.crystalRequestId = `crystal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    setMessages(prev => [...prev, crystalMessage]);
+    
+    // Log crystal request
     messageLogger.logMessage({
-      type: MESSAGE_TYPES.TEXT,
-      sender: 'player',
-      content: playerMessage,
-      landmark: storyEngine.currentLandmark,
-      timestamp: new Date().toISOString(),
+      ...crystalMessage,
+      journeyId: journeyId || 'unknown',
     });
-
-    // Analyze message
-    const playerAnalysis = storyEngine.analyzePlayerMessage(playerMessage);
-    console.log('🔍 Player Analysis:', playerAnalysis);
-
-    // Update conversation memory
-    storyEngine.conversationMemory.currentThemes = playerAnalysis.topics;
-    storyEngine.conversationMemory.emotionalTone = playerAnalysis.emotionalTone;
-    storyEngine.conversationMemory.playerInterests = [...new Set([
-      ...storyEngine.conversationMemory.playerInterests,
-      ...playerAnalysis.expertiseNeeded
-    ])];
-
-    // Check for landmark changes
-    if (playerAnalysis.mentionedLandmarks.length > 0) {
-      const newLandmark = playerAnalysis.mentionedLandmarks[0];
-      if (newLandmark !== storyEngine.currentLandmark) {
-        console.log(`📍 Moving to ${WORLD_CONFIG.landmarks[newLandmark].name}`);
-        storyEngine.currentLandmark = newLandmark;
-      }
+    
+    // If crystal was auto-deducted, just show info message
+    if (tokenResult.crystalDeducted) {
+      // Set a timer to auto-acknowledge after showing the info
+      setTimeout(() => {
+        handleCrystalChoice(crystalMessage.crystalRequestId, 'acknowledge');
+      }, 3000);
+    } else {
+      // Lock input until player makes a choice
+      setIsLocked(true);
     }
+  };
 
-    // Determine responding companions
-    const respondingCompanions = storyEngine.determineRespondingCompanions(playerAnalysis);
-    console.log('👥 Responding companions:', respondingCompanions);
-
-    const responses = [];
-
-    // Generate primary responses
-    for (const companion of respondingCompanions) {
-      try {
-        const context = {
-          currentLandmark: storyEngine.currentLandmark,
-          emotionalTone: playerAnalysis.emotionalTone,
-          topics: playerAnalysis.topics,
-          responseType: 'primary'
-        };
-
-        const response = await openAIService.generateCompanionResponse(
-          companion,
-          playerMessage,
-          context
-        );
-
-        // Update companion state
-        storyEngine.companionStates[companion].lastSpoke = storyEngine.messageCount;
-        storyEngine.companionStates[companion].recentTopics = playerAnalysis.topics;
-
-        // Show typing indicator for current companion
-        setCurrentlyTypingCompanion(response.sender);
-        
-        // Create and add companion message
-        const companionMessage = createMessage(
-          MESSAGE_TYPES.TEXT,
-          response.sender,
-          response.text,
-          'stage'
-        );
-        
-        setMessages(prev => [...prev, companionMessage]);
-        // Log companion message
-        messageLogger.logMessage({
-          type: MESSAGE_TYPES.TEXT,
-          sender: companion,
-          content: response.text,
-          landmark: storyEngine.currentLandmark,
-          timestamp: new Date().toISOString(),
-        });
-
-        responses.push({
-          type: 'companion',
-          sender: companion,
-          text: response.text,
-          tokensUsed: response.tokensUsed,
-          totalTokens: response.totalTokens
-        });
-
-      } catch (error) {
-        console.error(`Error generating response for ${companion}:`, error);
-      }
+  const generateContextualCrystalMessage = async (tokenResult, requestingCompanion) => {
+    
+    // Add crystal cost and action context
+    if (tokenResult.crystalDeducted) {
+      return `✨ A crystal has been used to sustain this magical experience. You have ${tokenResult.remainingCrystals} crystals remaining.`;
+    } else if (crystals >= (tokenResult.crystalCost || 1)) {
+      return `💎 Would you like to use 1 crystal to continue this magical conversation?`;
+    } else {
+      return `💔 You need crystals to continue this magical experience. Visit the Crystal Shop to gather more magical energy.`;
     }
-
-    // Check if companions should discuss
-    if (storyEngine.shouldCompanionsDiscuss(playerAnalysis, respondingCompanions) && respondingCompanions.length >= 2) {
-      console.log('💬 Companions are discussing...');
-      
-      const [companion1, companion2] = respondingCompanions;
-      const discussionTopic = playerAnalysis.topics[0] || playerMessage;
-      
-      try {
-        // Companion 1 responds to Companion 2's perspective
-        const discussion1 = await openAIService.generateCompanionDiscussion(
-          companion1,
-          companion2,
-          discussionTopic,
-          { currentLandmark: this.currentLandmark }
-        );
-
-        // Show typing indicator for current companion
-        setCurrentlyTypingCompanion(companion1);
-        
-        // Create and add companion message
-        const companionMessage = createMessage(
-          MESSAGE_TYPES.TEXT,
-          companion1,
-          discussion1.text,
-          'stage'
-        );
-        
-        setMessages(prev => [...prev, companionMessage]);
-
-        responses.push({
-          type: 'discussion',
-          sender: companion1,
-          text: discussion1.text,
-          discussingWith: companion2,
-          tokensUsed: discussion1.tokensUsed
-        });
-
-        // Companion 2 might respond back
-        if (Math.random() < 0.4) {
-          const discussion2 = await openAIService.generateCompanionDiscussion(
-            companion2,
-            companion1,
-            discussionTopic,
-            { currentLandmark: this.currentLandmark }
-          );
-          
-          // Show typing indicator for current companion
-        setCurrentlyTypingCompanion(companion2);
-        
-        // Create and add companion message
-        const companionMessage = createMessage(
-          MESSAGE_TYPES.TEXT,
-          companion2,
-          discussion2.text,
-          'stage'
-        );
-        
-        setMessages(prev => [...prev, companionMessage]);
-
-          responses.push({
-            type: 'discussion',
-            sender: companion2,
-            text: discussion2.text,
-            discussingWith: companion1,
-            tokensUsed: discussion2.tokensUsed
-          });
-        }
-
-        // Possible synthesis from third companion
-        // if (respondingCompanions.length === 3 && Math.random() < 0.2) {
-        //   const companion3 = respondingCompanions[2];
-        //   const synthesis = await openAIService.generateCompanionResponse(
-        //     companion3,
-        //     `Synthesize the perspectives on: ${discussionTopic}`,
-        //     {
-        //       currentLandmark: this.currentLandmark,
-        //       responseType: 'synthesis',
-        //       shouldSynthesize: true
-        //     }
-        //   );
-
-        //   responses.push({
-        //     type: 'synthesis',
-        //     sender: companion3,
-        //     text: synthesis.text,
-        //     tokensUsed: synthesis.tokensUsed
-        //   });
-        // }
-      } catch (error) {
-        console.error('Error generating discussion:', error);
-      }
-    }
-
-    return responses;
-  }
+  };
 
   // 🔥 NEW: Handle crystal choice from message bubble
   const handleCrystalChoice = async (crystalRequestId, choice) => {
     console.log('💎 Crystal choice made:', choice, 'for request:', crystalRequestId);
-    
-    // Find the crystal request message
-    // const requestMessage = messages.find(msg => msg.crystalRequestId === crystalRequestId);
-    // if (!requestMessage) {
-    //   console.error('Crystal request message not found');
-    //   return;
-    // }
     
     // Update the message to show the choice was made
     setMessages(prev => 
@@ -699,7 +796,7 @@ export default function ChatScreen({ navigation, route }) {
         // Multi-companion additions
         activeCompanions: activeCompanions,
       };
-      
+      console.log('💾conversationHistory:',openAIService.getConversationHistory())
       await journeyService.saveJourneyState(user.uid, journeyData);
       console.log('💾 Multi-companion journey state saved');
     } catch (error) {
@@ -708,6 +805,7 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   const renderMessage = ({ item }) => (
+    //console.log('🔍 Rendering message:', item),
     <MessageBubble 
       message={item} 
       storyContext={storyContext}
@@ -724,26 +822,32 @@ export default function ChatScreen({ navigation, route }) {
     if (isLocked) return "Waiting for your crystal choice...";
     if (isProcessingResponses) return "Companions are discussing...";
     
-    if (currentBeat) {
-      const beatPlaceholders = {
-        'arrival_wonder': "Share your feeling...",
-        'location_introduction': "Say hello and meet your companions...",
-        'companion_introductions': "Talk with Elara, Bramble, and Kael...",
-        'first_interaction': "Share your feelings with your companions...",
-        'mystery_hint': "Share your feelings with your companions...",
+    // if (currentBeat) {
+    //   const beatPlaceholders = {
+    //     'arrival_wonder': "Share your feeling...",
+    //     'location_introduction': "Say hello and meet your companions...",
+    //     'companion_introductions': "Talk with Elara, Bramble, and Kael...",
+    //     'first_interaction': "Share your feelings with your companions...",
+    //     'mystery_hint': "Share your feelings with your companions...",
         
-        'council_arrival': "Express your amazement to your companions...",
-        'nature_interaction': "Share your feelings with your companions...",
-        'hidden_discovery': "Share your feelings with your companions...",
-        'path_selection': "Discuss the paths with your companions...",
-        'heart_arrival': "Share your feelings with your companions...",
-        'memory_sharing': "Share your feelings with your companions...",
-      };
+    //     'council_arrival': "Express your amazement to your companions...",
+    //     'nature_interaction': "Share your feelings with your companions...",
+    //     'hidden_discovery': "Share your feelings with your companions...",
+    //     'path_selection': "Discuss the paths with your companions...",
+    //     'heart_arrival': "Share your feelings with your companions...",
+    //     'memory_sharing': "Share your feelings with your companions...",
+    //   };
       
-      return beatPlaceholders[currentBeat.id] || "Share your thoughts with your companions...";
+    //   return beatPlaceholders[currentBeat.id] || "Share your thoughts with your companions...";
+    // }
+    if(currentBeat.id==='location_introduction'){
+      currentBeat.id='continue';
+      return "Say hello and meet your companions...";
+    }else{
+      return "What would you like to ask your companions?";
     }
     
-    return "What would you like to ask your companions?";
+    
   };
 
   if (isLoading) {
@@ -767,7 +871,7 @@ export default function ChatScreen({ navigation, route }) {
           navigation.navigate('Home');
         }}
         crystals={crystals}
-        stage={currentStage}
+        stage={'STAGE'}
         tokenProgress={tokenProgress}
         storyContext={storyContext}
         activeCompanions={activeCompanions}
@@ -791,15 +895,10 @@ export default function ChatScreen({ navigation, route }) {
           <ActivityIndicator size="small" color="#8B5CF6" />
           <Text style={styles.typingText}>
             {currentlyTypingCompanion ? 
-              `${CHARACTER_INFO[currentlyTypingCompanion]?.name || 'Companion'} is responding...` : 
+              `${COMPANION_CONFIG[currentlyTypingCompanion]?.name || 'Companion'} is responding...` : 
               isProcessingResponses ? 'Companions are discussing...' : 'Thinking...'
             }
           </Text>
-          {isProcessingResponses && (
-            <Text style={styles.processingText}>
-              Multiple responses incoming
-            </Text>
-          )}
         </View>
       )}
 
